@@ -45,6 +45,7 @@ async function githubRequest(token: string, method: string, url: string, body?: 
 		},
 		body: body ? JSON.stringify(body) : undefined
 	});
+	if (resp.status === 404) return null;
 	if (!resp.ok) {
 		const err = await resp.text();
 		throw new Error(`GitHub API error ${resp.status}: ${err}`);
@@ -113,30 +114,38 @@ export default class GHSyncPlugin extends Plugin {
 
 		for (const file of files) {
 			const localContent = await this.app.vault.read(file);
-			const localBase64 = btoa(unescape(encodeURIComponent(localContent)));
+			const localBase64 = btoa(String.fromCharCode(...new TextEncoder().encode(localContent)));
 
 			let remoteFile: any = null;
 			try {
 				remoteFile = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}/contents/${file.path}`);
-			} catch (e: any) {
-				// 404 = file doesn't exist on remote yet, we'll create it
-				if (!String(e.message).includes('404')) {
-					this.showNotice(e, 'ERROR', 10000);
-					return;
-				}
+			} catch (e) {
+				this.showNotice(e, 'ERROR', 10000);
+				return;
 			}
 
 			if (remoteFile) {
 				const remoteBase64 = remoteFile.content.replace(/\n/g, '');
-				const remoteContent = decodeURIComponent(escape(atob(remoteBase64)));
+				const remoteBytes = Uint8Array.from(atob(remoteBase64), c => c.charCodeAt(0));
+				const remoteContent = new TextDecoder().decode(remoteBytes);
 
 				if (remoteContent === localContent) {
 					// No changes, skip
 					continue;
 				}
 
-				// Both sides differ — treat as conflict
+				// Remote and local differ — push local (local wins), notify user of conflict
 				conflicts.push(file.path);
+				try {
+					await githubRequest(token, 'PUT', `https://api.github.com/repos/${owner}/${repo}/contents/${file.path}`, {
+						message: msg,
+						content: localBase64,
+						sha: remoteFile.sha,
+					});
+				} catch (e) {
+					this.showNotice(e, 'ERROR', 10000);
+					return;
+				}
 				continue;
 			}
 
@@ -194,7 +203,8 @@ export default class GHSyncPlugin extends Plugin {
 
 				if (remoteFile) {
 					const localContent = await this.app.vault.read(file);
-					const remoteContent = decodeURIComponent(escape(atob(remoteFile.content.replace(/\n/g, ''))));
+					const remoteBytes = Uint8Array.from(atob(remoteFile.content.replace(/\n/g, '')), c => c.charCodeAt(0));
+					const remoteContent = new TextDecoder().decode(remoteBytes);
 					if (remoteContent !== localContent) {
 						behind = true;
 						break;
