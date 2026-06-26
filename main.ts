@@ -1,5 +1,5 @@
-import { App, Notice, Platform, Plugin, PluginSettingTab, Setting } from 'obsidian';
-import { setIntervalAsync } from 'set-interval-async';
+import { App, Editor, MarkdownView, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { setIntervalAsync, clearIntervalAsync } from 'set-interval-async';
 
 type NoticeLevelSetting = 'ALL' | 'WARNING' | 'ERROR';
 type LegacyNoticeLevelSetting = NoticeLevelSetting | 'WARNINGS';
