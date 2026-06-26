@@ -191,6 +191,7 @@ export default class GHSyncPlugin extends Plugin {
 				}
 
 				// Local and remote differ — local wins, push local content to remote
+				this.showNotice(`GitHub Sync: WARNING – overwriting remote changes with local version for: ${file.path}`, 'WARNING', 10000);
 				try {
 					await githubRequest(token, 'PUT', buildContentsApiUrl(owner, repo, file.path), {
 						message: msg,
