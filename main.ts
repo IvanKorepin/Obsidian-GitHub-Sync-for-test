@@ -27,18 +27,29 @@ const DEFAULT_SETTINGS: GHSyncSettings = {
 }
 
 function parseGitHubUrl(url: string): { owner: string; repo: string } | null {
-	const https = url.match(/github\.com\/([^\/]+)\/([^\/]+?)(?:\.git)?$/);
+	const normalized = url.trim().replace(/\/+$/, '');
+	const https = normalized.match(/github\.com\/([^\/]+)\/([^\/]+?)(?:\.git)?$/);
 	if (https) return { owner: https[1], repo: https[2] };
-	const ssh = url.match(/github\.com:([^\/]+)\/([^\/]+?)(?:\.git)?$/);
+	const ssh = normalized.match(/github\.com:([^\/]+)\/([^\/]+?)(?:\.git)?$/);
 	if (ssh) return { owner: ssh[1], repo: ssh[2] };
+	const sshWithProtocol = normalized.match(/ssh:\/\/git@github\.com\/([^\/]+)\/([^\/]+?)(?:\.git)?$/);
+	if (sshWithProtocol) return { owner: sshWithProtocol[1], repo: sshWithProtocol[2] };
 	return null;
 }
 
 function encodeBase64Content(content: string): string {
 	const bytes = new TextEncoder().encode(content);
-	let binary = '';
-	for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-	return btoa(binary);
+	const chunkSize = 0x4000;
+	const binaryChunks: string[] = [];
+	for (let i = 0; i < bytes.length; i += chunkSize) {
+		const chunk = bytes.subarray(i, i + chunkSize);
+		const chars = new Array(chunk.length);
+		for (let j = 0; j < chunk.length; j++) {
+			chars[j] = String.fromCharCode(chunk[j]);
+		}
+		binaryChunks.push(chars.join(''));
+	}
+	return btoa(binaryChunks.join(''));
 }
 
 function decodeBase64Content(base64: string): string {
@@ -50,7 +61,7 @@ async function githubRequest(token: string, method: string, url: string, body?: 
 	const resp = await fetch(url, {
 		method,
 		headers: {
-			'Authorization': 'token ' + token,
+			'Authorization': 'Bearer ' + token,
 			'Accept': 'application/vnd.github+json',
 			'Content-Type': 'application/json',
 			'X-GitHub-Api-Version': '2022-11-28'
@@ -65,6 +76,28 @@ async function githubRequest(token: string, method: string, url: string, body?: 
 	// 204 No Content
 	if (resp.status === 204) return null;
 	return resp.json();
+}
+
+function buildContentsApiUrl(owner: string, repo: string, path: string): string {
+	const encodedPath = path.split('/').map((segment) => encodeURIComponent(segment)).join('/');
+	return `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`;
+}
+
+async function getRemoteFileContent(token: string, owner: string, repo: string, remoteFile: any): Promise<string> {
+	if (typeof remoteFile.content === 'string') {
+		return decodeBase64Content(remoteFile.content);
+	}
+
+	if (!remoteFile.sha) {
+		throw new Error('GitHub Sync: Remote file content is unavailable.');
+	}
+
+	const blob = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}/git/blobs/${remoteFile.sha}`);
+	if (!blob || typeof blob.content !== 'string') {
+		throw new Error('GitHub Sync: Failed to load remote file content.');
+	}
+
+	return decodeBase64Content(blob.content);
 }
 
 export default class GHSyncPlugin extends Plugin {
@@ -130,14 +163,20 @@ export default class GHSyncPlugin extends Plugin {
 
 			let remoteFile: any = null;
 			try {
-				remoteFile = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}/contents/${file.path}`);
+				remoteFile = await githubRequest(token, 'GET', buildContentsApiUrl(owner, repo, file.path));
 			} catch (e) {
 				this.showNotice(e, 'ERROR', 10000);
 				return;
 			}
 
 			if (remoteFile) {
-				const remoteContent = decodeBase64Content(remoteFile.content);
+				let remoteContent: string;
+				try {
+					remoteContent = await getRemoteFileContent(token, owner, repo, remoteFile);
+				} catch (e) {
+					this.showNotice(e, 'ERROR', 10000);
+					return;
+				}
 
 				if (remoteContent === localContent) {
 					// No changes, skip
@@ -147,7 +186,7 @@ export default class GHSyncPlugin extends Plugin {
 				// Remote and local differ — push local (local wins), notify user of conflict
 				conflicts.push(file.path);
 				try {
-					await githubRequest(token, 'PUT', `https://api.github.com/repos/${owner}/${repo}/contents/${file.path}`, {
+					await githubRequest(token, 'PUT', buildContentsApiUrl(owner, repo, file.path), {
 						message: msg,
 						content: localBase64,
 						sha: remoteFile.sha,
@@ -161,7 +200,7 @@ export default class GHSyncPlugin extends Plugin {
 
 			// File doesn't exist on remote — create it
 			try {
-				await githubRequest(token, 'PUT', `https://api.github.com/repos/${owner}/${repo}/contents/${file.path}`, {
+				await githubRequest(token, 'PUT', buildContentsApiUrl(owner, repo, file.path), {
 					message: msg,
 					content: localBase64,
 				});
@@ -175,7 +214,7 @@ export default class GHSyncPlugin extends Plugin {
 			const conflictMsg = `Local version pushed (overwrote remote) for:\n\t${conflicts.join('\n\t')}\nReview these files to ensure the intended changes were kept.`;
 			this.showNotice(conflictMsg, 'WARNING');
 			for (const c of conflicts) {
-				this.app.workspace.openLinkText("", c, true);
+				this.app.workspace.openLinkText(c, "", true);
 			}
 			return;
 		}
@@ -203,15 +242,18 @@ export default class GHSyncPlugin extends Plugin {
 			let behind = false;
 
 			for (const file of files) {
-				const remoteFile = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}/contents/${file.path}`);
+				const remoteFile = await githubRequest(token, 'GET', buildContentsApiUrl(owner, repo, file.path));
 
 				if (remoteFile) {
 					const localContent = await this.app.vault.read(file);
-					const remoteContent = decodeBase64Content(remoteFile.content);
+					const remoteContent = await getRemoteFileContent(token, owner, repo, remoteFile);
 					if (remoteContent !== localContent) {
 						behind = true;
 						break;
 					}
+				} else {
+					behind = true;
+					break;
 				}
 			}
 
@@ -219,7 +261,7 @@ export default class GHSyncPlugin extends Plugin {
 				if (this.settings.isSyncOnLoad) {
 					this.SyncNotes();
 				} else {
-					this.showNotice("GitHub Sync: vault is behind remote.\nClick the GitHub ribbon icon to sync.", 'WARNING');
+					this.showNotice("GitHub Sync: vault content differs from remote.\nClick the GitHub ribbon icon to sync.", 'WARNING');
 				}
 			} else {
 				this.showNotice("GitHub Sync: up to date with remote.", 'INFO');
@@ -391,4 +433,3 @@ class GHSyncSettingTab extends PluginSettingTab {
 				}));
 	}
 }
-
