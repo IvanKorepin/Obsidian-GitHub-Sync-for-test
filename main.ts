@@ -27,18 +27,30 @@ const DEFAULT_SETTINGS: GHSyncSettings = {
 }
 
 function parseGitHubUrl(url: string): { owner: string; repo: string } | null {
-	const https = url.match(/github\.com\/([^\/]+)\/([^\/\.]+)/);
+	const https = url.match(/github\.com\/([^\/]+)\/([^\/]+?)(?:\.git)?$/);
 	if (https) return { owner: https[1], repo: https[2] };
-	const ssh = url.match(/github\.com:([^\/]+)\/([^\/\.]+)/);
+	const ssh = url.match(/github\.com:([^\/]+)\/([^\/]+?)(?:\.git)?$/);
 	if (ssh) return { owner: ssh[1], repo: ssh[2] };
 	return null;
+}
+
+function encodeBase64Content(content: string): string {
+	const bytes = new TextEncoder().encode(content);
+	let binary = '';
+	for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+	return btoa(binary);
+}
+
+function decodeBase64Content(base64: string): string {
+	const bytes = Uint8Array.from(atob(base64.replace(/\n/g, '')), c => c.charCodeAt(0));
+	return new TextDecoder().decode(bytes);
 }
 
 async function githubRequest(token: string, method: string, url: string, body?: object): Promise<any> {
 	const resp = await fetch(url, {
 		method,
 		headers: {
-			'Authorization': 'Bearer ' + token,
+			'Authorization': 'token ' + token,
 			'Accept': 'application/vnd.github+json',
 			'Content-Type': 'application/json',
 			'X-GitHub-Api-Version': '2022-11-28'
@@ -114,7 +126,7 @@ export default class GHSyncPlugin extends Plugin {
 
 		for (const file of files) {
 			const localContent = await this.app.vault.read(file);
-			const localBase64 = btoa(String.fromCharCode(...new TextEncoder().encode(localContent)));
+			const localBase64 = encodeBase64Content(localContent);
 
 			let remoteFile: any = null;
 			try {
@@ -125,9 +137,7 @@ export default class GHSyncPlugin extends Plugin {
 			}
 
 			if (remoteFile) {
-				const remoteBase64 = remoteFile.content.replace(/\n/g, '');
-				const remoteBytes = Uint8Array.from(atob(remoteBase64), c => c.charCodeAt(0));
-				const remoteContent = new TextDecoder().decode(remoteBytes);
+				const remoteContent = decodeBase64Content(remoteFile.content);
 
 				if (remoteContent === localContent) {
 					// No changes, skip
@@ -162,7 +172,7 @@ export default class GHSyncPlugin extends Plugin {
 		}
 
 		if (conflicts.length > 0) {
-			const conflictMsg = `Merge conflicts in:\n\t${conflicts.join('\n\t')}\nResolve them or click sync button again to push with unresolved conflicts.`;
+			const conflictMsg = `Local version pushed (overwrote remote) for:\n\t${conflicts.join('\n\t')}\nReview these files to ensure the intended changes were kept.`;
 			this.showNotice(conflictMsg, 'WARNING');
 			for (const c of conflicts) {
 				this.app.workspace.openLinkText("", c, true);
@@ -193,18 +203,11 @@ export default class GHSyncPlugin extends Plugin {
 			let behind = false;
 
 			for (const file of files) {
-				let remoteFile: any = null;
-				try {
-					remoteFile = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}/contents/${file.path}`);
-				} catch (e) {
-					// file not on remote, skip
-					continue;
-				}
+				const remoteFile = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}/contents/${file.path}`);
 
 				if (remoteFile) {
 					const localContent = await this.app.vault.read(file);
-					const remoteBytes = Uint8Array.from(atob(remoteFile.content.replace(/\n/g, '')), c => c.charCodeAt(0));
-					const remoteContent = new TextDecoder().decode(remoteBytes);
+					const remoteContent = decodeBase64Content(remoteFile.content);
 					if (remoteContent !== localContent) {
 						behind = true;
 						break;
@@ -331,6 +334,7 @@ class GHSyncSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					});
 				text.inputEl.type = 'password';
+				text.inputEl.autocomplete = 'off';
 			});
 
 		new Setting(containerEl)
