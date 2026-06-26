@@ -1,9 +1,5 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, Vault } from 'obsidian';
-import { simpleGit, SimpleGit, CleanOptions, SimpleGitOptions } from 'simple-git';
+import { App, Editor, MarkdownView, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting } from 'obsidian';
 import { setIntervalAsync, clearIntervalAsync } from 'set-interval-async';
-
-let simpleGitOptions: Partial<SimpleGitOptions>;
-let git: SimpleGit;
 
 type NoticeLevelSetting = 'ALL' | 'WARNING' | 'ERROR';
 type LegacyNoticeLevelSetting = NoticeLevelSetting | 'WARNINGS';
@@ -12,7 +8,7 @@ type NoticeSeverity = 'INFO' | 'WARNING' | 'ERROR';
 
 interface GHSyncSettings {
 	remoteURL: string;
-	gitLocation: string;
+	githubToken: string;
 	syncinterval: number;
 	isSyncOnLoad: boolean;
 	checkStatusOnLoad: boolean;
@@ -22,7 +18,7 @@ interface GHSyncSettings {
 
 const DEFAULT_SETTINGS: GHSyncSettings = {
 	remoteURL: '',
-	gitLocation: '',
+	githubToken: '',
 	syncinterval: 0,
 	isSyncOnLoad: false,
 	checkStatusOnLoad: true,
@@ -30,6 +26,85 @@ const DEFAULT_SETTINGS: GHSyncSettings = {
 	showSyncSuccessNotice: true,
 }
 
+function parseGitHubUrl(url: string): { owner: string; repo: string } | null {
+	const normalized = url.trim().replace(/\/+$/, '');
+	const https = normalized.match(/github\.com\/([^\/]+)\/([^\/]+?)(?:\.git)?$/);
+	if (https) return { owner: https[1], repo: https[2] };
+	const ssh = normalized.match(/github\.com:([^\/]+)\/([^\/]+?)(?:\.git)?$/);
+	if (ssh) return { owner: ssh[1], repo: ssh[2] };
+	const sshWithProtocol = normalized.match(/ssh:\/\/git@github\.com\/([^\/]+)\/([^\/]+?)(?:\.git)?$/);
+	if (sshWithProtocol) return { owner: sshWithProtocol[1], repo: sshWithProtocol[2] };
+	return null;
+}
+
+function encodeBase64Content(bytes: Uint8Array): string {
+	const chunkSize = 0x4000;
+	const binaryChunks: string[] = [];
+	for (let i = 0; i < bytes.length; i += chunkSize) {
+		const chunk = bytes.subarray(i, i + chunkSize);
+		const chars = new Array(chunk.length);
+		for (let j = 0; j < chunk.length; j++) {
+			chars[j] = String.fromCharCode(chunk[j]);
+		}
+		binaryChunks.push(chars.join(''));
+	}
+	return btoa(binaryChunks.join(''));
+}
+
+async function githubRequest(token: string, method: string, url: string, body?: object): Promise<any> {
+	const resp = await fetch(url, {
+		method,
+		headers: {
+			'Authorization': 'token ' + token,
+			'Accept': 'application/vnd.github+json',
+			'Content-Type': 'application/json',
+			'X-GitHub-Api-Version': '2022-11-28'
+		},
+		body: body ? JSON.stringify(body) : undefined
+	});
+	if (resp.status === 404 && method === 'GET') return null;
+	if (!resp.ok) {
+		const err = await resp.text();
+		throw new Error(`GitHub API error ${resp.status}: ${err}`);
+	}
+	// 204 No Content
+	if (resp.status === 204) return null;
+	return resp.json();
+}
+
+function buildContentsApiUrl(owner: string, repo: string, path: string): string {
+	const encodedPath = path.split('/').map((segment) => encodeURIComponent(segment)).join('/');
+	return `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`;
+}
+
+async function getRemoteBase64(token: string, owner: string, repo: string, remoteFile: any): Promise<string> {
+	if (typeof remoteFile.content === 'string') {
+		return remoteFile.content.replace(/\n/g, '');
+	}
+
+	if (!remoteFile.sha) {
+		throw new Error('GitHub Sync: Remote file content is unavailable.');
+	}
+
+	const blob = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}/git/blobs/${remoteFile.sha}`);
+	if (!blob || typeof blob.content !== 'string') {
+		throw new Error('GitHub Sync: Failed to load remote file content.');
+	}
+
+	return blob.content.replace(/\n/g, '');
+}
+
+async function listRemoteFilePaths(token: string, owner: string, repo: string): Promise<string[]> {
+	const repoData = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}`);
+	if (!repoData) return [];
+	const ref = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${repoData.default_branch}`);
+	if (!ref || !ref.object) return [];
+	const commit = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}/git/commits/${ref.object.sha}`);
+	if (!commit || !commit.tree) return [];
+	const tree = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}/git/trees/${commit.tree.sha}?recursive=1`);
+	if (!tree || !tree.tree) return [];
+	return tree.tree.filter((item: any) => item.type === 'blob').map((item: any) => item.path as string);
+}
 
 export default class GHSyncPlugin extends Plugin {
 
@@ -67,139 +142,184 @@ export default class GHSyncPlugin extends Plugin {
 	async SyncNotes()
 	{
 		const remote = this.settings.remoteURL.trim();
+		const token = this.settings.githubToken.trim();
 
-		simpleGitOptions = {
-			//@ts-ignore
-		    baseDir: this.app.vault.adapter.getBasePath(),
-		    binary: this.settings.gitLocation + "git",
-		    maxConcurrentProcesses: 6,
-		    trimmed: false,
-		};
-		git = simpleGit(simpleGitOptions);
-
-		let os = require("os");
-		let hostname = os.hostname();
-
-		let statusResult = await git.status().catch((e) => {
-			this.showNotice("Vault is not a Git repo or git binary cannot be found.", 'ERROR', 10000);
-			return; })
-
-		if (!statusResult) {
+		if (!remote || !token) {
+			this.showNotice("GitHub Sync: Remote URL and GitHub Token are required.", 'ERROR', 10000);
 			return;
 		}
 
-		//@ts-ignore
-		let clean = statusResult.isClean();
+		const parsed = parseGitHubUrl(remote);
+		if (!parsed) {
+			this.showNotice("GitHub Sync: Could not parse owner/repo from Remote URL.", 'ERROR', 10000);
+			return;
+		}
+		const { owner, repo } = parsed;
 
-    	let date = new Date();
-    	let msg = hostname + " " + date.getFullYear() + "-" + (date.getMonth() + 1) + "-" + date.getDate() + ":" + date.getHours() + ":" + date.getMinutes() + ":" + date.getSeconds();
+		const hostname = Platform.isMobileApp ? "mobile" : "desktop";
+		const date = new Date();
+		const msg = `${hostname} ${date.getFullYear()}-${date.getMonth()+1}-${date.getDate()}:${date.getHours()}:${date.getMinutes()}:${date.getSeconds()}`;
 
-		// git add .
-		// git commit -m hostname-date-time
-		if (!clean) {
+		const files = this.app.vault.getFiles();
+		const localFilePaths = new Set(files.map(f => f.path));
+		const updatedFromRemote: string[] = [];
+
+		for (const file of files) {
+			const fileData = await this.app.vault.readBinary(file);
+			const localBase64 = encodeBase64Content(new Uint8Array(fileData));
+
+			let remoteFile: any = null;
 			try {
-				await git
-		    		.add("./*")
-		    		.commit(msg);
-		    } catch (e) {
-		    	this.showNotice(e, 'ERROR', 10000);
-		    	return;
-		    }
+				remoteFile = await githubRequest(token, 'GET', buildContentsApiUrl(owner, repo, file.path));
+			} catch (e) {
+				this.showNotice(e, 'ERROR', 10000);
+				return;
+			}
+
+			if (remoteFile) {
+				let remoteBase64: string;
+				try {
+					remoteBase64 = await getRemoteBase64(token, owner, repo, remoteFile);
+				} catch (e) {
+					this.showNotice(e, 'ERROR', 10000);
+					return;
+				}
+
+				if (remoteBase64 === localBase64) {
+					// No changes, skip
+					continue;
+				}
+
+				// Local and remote differ — local wins, push local content to remote
+				this.showNotice(`GitHub Sync: WARNING – overwriting remote changes with local version for: ${file.path}`, 'WARNING', 10000);
+				try {
+					await githubRequest(token, 'PUT', buildContentsApiUrl(owner, repo, file.path), {
+						message: msg,
+						content: localBase64,
+						sha: remoteFile.sha,
+					});
+				} catch (e) {
+					this.showNotice(e, 'ERROR', 10000);
+					return;
+				}
+				continue;
+			}
+
+			// File doesn't exist on remote — create it
+			try {
+				await githubRequest(token, 'PUT', buildContentsApiUrl(owner, repo, file.path), {
+					message: msg,
+					content: localBase64,
+				});
+			} catch (e) {
+				this.showNotice(e, 'ERROR', 10000);
+				return;
+			}
 		}
 
-		// configure remote
+		// Download remote files that don't exist locally
+		let remoteFilePaths: string[] = [];
 		try {
-			await git.removeRemote('origin').catch((e) => { this.showNotice(e, 'ERROR', 10000); });
-			await git.addRemote('origin', remote).catch((e) => { this.showNotice(e, 'ERROR', 10000); });
-		}
-		catch (e) {
+			remoteFilePaths = await listRemoteFilePaths(token, owner, repo);
+		} catch (e) {
 			this.showNotice(e, 'ERROR', 10000);
 			return;
 		}
-		// check if remote url valid by fetching
-		try {
-			await git.fetch();
-		} catch (e) {
-			this.showNotice(String(e) + "\nGitHub Sync: Invalid remote URL.", 'ERROR', 10000);
-			return;
+
+		for (const remotePath of remoteFilePaths) {
+			if (localFilePaths.has(remotePath)) continue;
+			try {
+				const remoteFile = await githubRequest(token, 'GET', buildContentsApiUrl(owner, repo, remotePath));
+				if (!remoteFile) continue;
+				const remoteBase64 = await getRemoteBase64(token, owner, repo, remoteFile);
+				const binary = atob(remoteBase64);
+				const bytes = new Uint8Array(binary.length);
+				for (let i = 0; i < binary.length; i++) {
+					bytes[i] = binary.charCodeAt(i);
+				}
+				const lastSlash = remotePath.lastIndexOf('/');
+				const dirPath = lastSlash >= 0 ? remotePath.substring(0, lastSlash) : '';
+				if (dirPath) {
+					// createFolder throws if the folder already exists; suppress that error
+					await this.app.vault.createFolder(dirPath).catch(() => {});
+				}
+				await this.app.vault.createBinary(remotePath, bytes.buffer);
+				updatedFromRemote.push(remotePath);
+			} catch (e) {
+				this.showNotice(e, 'ERROR', 10000);
+				return;
+			}
 		}
 
-		// git pull origin main
-	    try {
-	    	//@ts-ignore
-	    	await git.pull('origin', 'main', { '--no-rebase': null }, (err, update) => {
-	   		})
-	    } catch (e) {
-	    	let conflictStatus = await git.status().catch((error) => { this.showNotice(error, 'ERROR', 10000); return; });
-	    	if (!conflictStatus) {
-	    		return;
-	    	}
-    		let conflictMsg = "Merge conflicts in:";
-	    	//@ts-ignore
-			for (let c of conflictStatus.conflicted)
-			{
-				conflictMsg += "\n\t"+c;
-			}
-			conflictMsg += "\nResolve them or click sync button again to push with unresolved conflicts."
-			this.showNotice(conflictMsg, 'WARNING');
-			//@ts-ignore	
-			for (let c of conflictStatus.conflicted)
-			{
-				this.app.workspace.openLinkText("", c, true);
-			}
-	    	return;
-	    }
-
-		// resolve merge conflicts
-		// git push origin main
-	    if (!clean) {
-		    try {
-		    	await git.push('origin', 'main', ['-u']);
-		    } catch (e) {
-		    	this.showNotice(e, 'ERROR', 10000);
-		    	return;
-			}
-	    }
+		if (updatedFromRemote.length > 0) {
+			const updateMsg = `GitHub Sync: Updated from remote:\n\t${updatedFromRemote.join('\n\t')}`;
+			this.showNotice(updateMsg, 'INFO');
+			return;
+		}
 
 		this.showSyncSuccessNotice();
 	}
 
 	async CheckStatusOnStart()
 	{
-		// check status
 		try {
-			simpleGitOptions = {
-				//@ts-ignore
-			    baseDir: this.app.vault.adapter.getBasePath(),
-			    binary: this.settings.gitLocation + "git",
-			    maxConcurrentProcesses: 6,
-			    trimmed: false,
-			};
-			git = simpleGit(simpleGitOptions);
+			const remote = this.settings.remoteURL.trim();
+			const token = this.settings.githubToken.trim();
 
-			//check for remote changes
-			// git branch --set-upstream-to=origin/main main
-			await git.branch({'--set-upstream-to': 'origin/main'});
-			let statusUponOpening = await git.fetch().status();
-			if (statusUponOpening.behind > 0)
-			{
-				// Automatically sync if needed
-				if (this.settings.isSyncOnLoad == true)
-				{
-					this.SyncNotes();
-				}
-				else
-				{
-					this.showNotice("GitHub Sync: " + statusUponOpening.behind + " commits behind remote.\nClick the GitHub ribbon icon to sync.", 'WARNING');
+			if (!remote || !token) {
+				return;
+			}
+
+			const parsed = parseGitHubUrl(remote);
+			if (!parsed) {
+				return;
+			}
+			const { owner, repo } = parsed;
+
+			const files = this.app.vault.getFiles();
+			const localFilePaths = new Set(files.map(f => f.path));
+			// 'behind' means the vault is out of sync with remote in any direction
+			let behind = false;
+
+			for (const file of files) {
+				const remoteFile = await githubRequest(token, 'GET', buildContentsApiUrl(owner, repo, file.path));
+
+				if (remoteFile) {
+					const fileData = await this.app.vault.readBinary(file);
+					const localBase64 = encodeBase64Content(new Uint8Array(fileData));
+					const remoteBase64 = await getRemoteBase64(token, owner, repo, remoteFile);
+					if (remoteBase64 !== localBase64) {
+						behind = true;
+						break;
+					}
+				} else {
+					behind = true;
+					break;
 				}
 			}
-			else
-			{
+
+			if (!behind) {
+				// Also check whether remote has files not present locally
+				const remoteFilePaths = await listRemoteFilePaths(token, owner, repo);
+				for (const remotePath of remoteFilePaths) {
+					if (!localFilePaths.has(remotePath)) {
+						behind = true;
+						break;
+					}
+				}
+			}
+
+			if (behind) {
+				if (this.settings.isSyncOnLoad) {
+					await this.SyncNotes();
+				} else {
+					this.showNotice("GitHub Sync: vault content differs from remote.\nClick the GitHub ribbon icon to sync.", 'WARNING');
+				}
+			} else {
 				this.showNotice("GitHub Sync: up to date with remote.", 'INFO');
 			}
 		} catch (e) {
 			// don't care
-			// based
 		}
 	}
 
@@ -277,7 +397,7 @@ class GHSyncSettingTab extends PluginSettingTab {
 
 		const howto = containerEl.createEl("div", { cls: "howto" });
 		howto.createEl("div", { text: "How to use this plugin", cls: "howto_title" });
-		howto.createEl("small", { text: "Grab your GitHub repository's HTTPS or SSH url and paste it into the settings here. If you're not authenticated, the first sync with this plugin should prompt you to authenticate. If you've already setup SSH on your device with GitHub, you won't need to authenticate - just paste your repo's SSH url into the settings here.", cls: "howto_text" });
+		howto.createEl("small", { text: "Grab your GitHub repository's HTTPS url and paste it into the settings here. Create a GitHub Personal Access Token with 'repo' scope and paste it in the token field below.", cls: "howto_text" });
 		howto.createEl("br");
         const linkEl = howto.createEl('p');
         linkEl.createEl('span', { text: 'See the ' });
@@ -297,16 +417,19 @@ class GHSyncSettingTab extends PluginSettingTab {
         	.inputEl.addClass('my-plugin-setting-text'));
 
 		new Setting(containerEl)
-			.setName('git binary location')
-			.setDesc('This is optional! Set this only if git is not findable via your system PATH, then provide its location here. See README for more info.')
-			.addText(text => text
-				.setPlaceholder('')
-				.setValue(this.plugin.settings.gitLocation)
-				.onChange(async (value) => {
-					this.plugin.settings.gitLocation = value;
-					await this.plugin.saveSettings();
-				})
-        	.inputEl.addClass('my-plugin-setting-text2'));
+			.setName('GitHub Personal Access Token')
+			.setDesc('Required for authentication. Create a token at github.com → Settings → Developer settings → Personal access tokens. Token needs "repo" scope. Note: this token is stored in plain text on disk and is not encrypted by Obsidian.')
+			.addText(text => {
+				text
+					.setPlaceholder('ghp_...')
+					.setValue(this.plugin.settings.githubToken)
+					.onChange(async (value) => {
+						this.plugin.settings.githubToken = value;
+						await this.plugin.saveSettings();
+					});
+				text.inputEl.type = 'password';
+				text.inputEl.autocomplete = 'off';
+			});
 
 		new Setting(containerEl)
 			.setName('Notice level')
