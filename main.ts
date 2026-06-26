@@ -37,8 +37,7 @@ function parseGitHubUrl(url: string): { owner: string; repo: string } | null {
 	return null;
 }
 
-function encodeBase64Content(content: string): string {
-	const bytes = new TextEncoder().encode(content);
+function encodeBase64Content(bytes: Uint8Array): string {
 	const chunkSize = 0x4000;
 	const binaryChunks: string[] = [];
 	for (let i = 0; i < bytes.length; i += chunkSize) {
@@ -52,16 +51,11 @@ function encodeBase64Content(content: string): string {
 	return btoa(binaryChunks.join(''));
 }
 
-function decodeBase64Content(base64: string): string {
-	const bytes = Uint8Array.from(atob(base64.replace(/\n/g, '')), c => c.charCodeAt(0));
-	return new TextDecoder().decode(bytes);
-}
-
 async function githubRequest(token: string, method: string, url: string, body?: object): Promise<any> {
 	const resp = await fetch(url, {
 		method,
 		headers: {
-			'Authorization': 'Bearer ' + token,
+			'Authorization': 'token ' + token,
 			'Accept': 'application/vnd.github+json',
 			'Content-Type': 'application/json',
 			'X-GitHub-Api-Version': '2022-11-28'
@@ -83,9 +77,9 @@ function buildContentsApiUrl(owner: string, repo: string, path: string): string 
 	return `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`;
 }
 
-async function getRemoteFileContent(token: string, owner: string, repo: string, remoteFile: any): Promise<string> {
+async function getRemoteBase64(token: string, owner: string, repo: string, remoteFile: any): Promise<string> {
 	if (typeof remoteFile.content === 'string') {
-		return decodeBase64Content(remoteFile.content);
+		return remoteFile.content.replace(/\n/g, '');
 	}
 
 	if (!remoteFile.sha) {
@@ -97,7 +91,17 @@ async function getRemoteFileContent(token: string, owner: string, repo: string, 
 		throw new Error('GitHub Sync: Failed to load remote file content.');
 	}
 
-	return decodeBase64Content(blob.content);
+	return blob.content.replace(/\n/g, '');
+}
+
+async function listRemoteFilePaths(token: string, owner: string, repo: string): Promise<string[]> {
+	const repoData = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}`);
+	if (!repoData) return [];
+	const ref = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${repoData.default_branch}`);
+	if (!ref || !ref.object) return [];
+	const tree = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}/git/trees/${ref.object.sha}?recursive=1`);
+	if (!tree || !tree.tree) return [];
+	return tree.tree.filter((item: any) => item.type === 'blob').map((item: any) => item.path as string);
 }
 
 export default class GHSyncPlugin extends Plugin {
@@ -155,11 +159,12 @@ export default class GHSyncPlugin extends Plugin {
 		const msg = `${hostname} ${date.getFullYear()}-${date.getMonth()+1}-${date.getDate()}:${date.getHours()}:${date.getMinutes()}:${date.getSeconds()}`;
 
 		const files = this.app.vault.getFiles();
-		const conflicts: string[] = [];
+		const localFilePaths = new Set(files.map(f => f.path));
+		const updatedFromRemote: string[] = [];
 
 		for (const file of files) {
-			const localContent = await this.app.vault.read(file);
-			const localBase64 = encodeBase64Content(localContent);
+			const fileData = await this.app.vault.readBinary(file);
+			const localBase64 = encodeBase64Content(new Uint8Array(fileData));
 
 			let remoteFile: any = null;
 			try {
@@ -170,27 +175,28 @@ export default class GHSyncPlugin extends Plugin {
 			}
 
 			if (remoteFile) {
-				let remoteContent: string;
+				let remoteBase64: string;
 				try {
-					remoteContent = await getRemoteFileContent(token, owner, repo, remoteFile);
+					remoteBase64 = await getRemoteBase64(token, owner, repo, remoteFile);
 				} catch (e) {
 					this.showNotice(e, 'ERROR', 10000);
 					return;
 				}
 
-				if (remoteContent === localContent) {
+				if (remoteBase64 === localBase64) {
 					// No changes, skip
 					continue;
 				}
 
-				// Remote and local differ — push local (local wins), notify user of conflict
-				conflicts.push(file.path);
+				// Remote and local differ — remote wins, update local from remote
 				try {
-					await githubRequest(token, 'PUT', buildContentsApiUrl(owner, repo, file.path), {
-						message: msg,
-						content: localBase64,
-						sha: remoteFile.sha,
-					});
+					const binary = atob(remoteBase64);
+					const bytes = new Uint8Array(binary.length);
+					for (let i = 0; i < binary.length; i++) {
+						bytes[i] = binary.charCodeAt(i);
+					}
+					await this.app.vault.modifyBinary(file, bytes.buffer);
+					updatedFromRemote.push(file.path);
 				} catch (e) {
 					this.showNotice(e, 'ERROR', 10000);
 					return;
@@ -210,12 +216,43 @@ export default class GHSyncPlugin extends Plugin {
 			}
 		}
 
-		if (conflicts.length > 0) {
-			const conflictMsg = `Local version pushed (overwrote remote) for:\n\t${conflicts.join('\n\t')}\nReview these files to ensure the intended changes were kept.`;
-			this.showNotice(conflictMsg, 'WARNING');
-			for (const c of conflicts) {
-				this.app.workspace.openLinkText(c, "", true);
+		// Download remote files that don't exist locally
+		let remoteFilePaths: string[] = [];
+		try {
+			remoteFilePaths = await listRemoteFilePaths(token, owner, repo);
+		} catch (e) {
+			this.showNotice(e, 'ERROR', 10000);
+			return;
+		}
+
+		for (const remotePath of remoteFilePaths) {
+			if (localFilePaths.has(remotePath)) continue;
+			try {
+				const remoteFile = await githubRequest(token, 'GET', buildContentsApiUrl(owner, repo, remotePath));
+				if (!remoteFile) continue;
+				const remoteBase64 = await getRemoteBase64(token, owner, repo, remoteFile);
+				const binary = atob(remoteBase64);
+				const bytes = new Uint8Array(binary.length);
+				for (let i = 0; i < binary.length; i++) {
+					bytes[i] = binary.charCodeAt(i);
+				}
+				const lastSlash = remotePath.lastIndexOf('/');
+				const dirPath = lastSlash >= 0 ? remotePath.substring(0, lastSlash) : '';
+				if (dirPath) {
+					// createFolder throws if the folder already exists; suppress that error
+					await this.app.vault.createFolder(dirPath).catch(() => {});
+				}
+				await this.app.vault.createBinary(remotePath, bytes.buffer);
+				updatedFromRemote.push(remotePath);
+			} catch (e) {
+				this.showNotice(e, 'ERROR', 10000);
+				return;
 			}
+		}
+
+		if (updatedFromRemote.length > 0) {
+			const updateMsg = `GitHub Sync: Updated from remote:\n\t${updatedFromRemote.join('\n\t')}`;
+			this.showNotice(updateMsg, 'INFO');
 			return;
 		}
 
@@ -239,21 +276,35 @@ export default class GHSyncPlugin extends Plugin {
 			const { owner, repo } = parsed;
 
 			const files = this.app.vault.getFiles();
+			const localFilePaths = new Set(files.map(f => f.path));
+			// 'behind' means the vault is out of sync with remote in any direction
 			let behind = false;
 
 			for (const file of files) {
 				const remoteFile = await githubRequest(token, 'GET', buildContentsApiUrl(owner, repo, file.path));
 
 				if (remoteFile) {
-					const localContent = await this.app.vault.read(file);
-					const remoteContent = await getRemoteFileContent(token, owner, repo, remoteFile);
-					if (remoteContent !== localContent) {
+					const fileData = await this.app.vault.readBinary(file);
+					const localBase64 = encodeBase64Content(new Uint8Array(fileData));
+					const remoteBase64 = await getRemoteBase64(token, owner, repo, remoteFile);
+					if (remoteBase64 !== localBase64) {
 						behind = true;
 						break;
 					}
 				} else {
 					behind = true;
 					break;
+				}
+			}
+
+			if (!behind) {
+				// Also check whether remote has files not present locally
+				const remoteFilePaths = await listRemoteFilePaths(token, owner, repo);
+				for (const remotePath of remoteFilePaths) {
+					if (!localFilePaths.has(remotePath)) {
+						behind = true;
+						break;
+					}
 				}
 			}
 
@@ -345,7 +396,7 @@ class GHSyncSettingTab extends PluginSettingTab {
 
 		const howto = containerEl.createEl("div", { cls: "howto" });
 		howto.createEl("div", { text: "How to use this plugin", cls: "howto_title" });
-		howto.createEl("small", { text: "Grab your GitHub repository's HTTPS or SSH url and paste it into the settings here. Create a GitHub Personal Access Token with 'repo' scope and paste it in the token field below.", cls: "howto_text" });
+		howto.createEl("small", { text: "Grab your GitHub repository's HTTPS url and paste it into the settings here. Create a GitHub Personal Access Token with 'repo' scope and paste it in the token field below.", cls: "howto_text" });
 		howto.createEl("br");
         const linkEl = howto.createEl('p');
         linkEl.createEl('span', { text: 'See the ' });
