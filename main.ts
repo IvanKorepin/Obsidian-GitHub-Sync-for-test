@@ -1,9 +1,5 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, Vault } from 'obsidian';
-import { simpleGit, SimpleGit, CleanOptions, SimpleGitOptions } from 'simple-git';
-import { setIntervalAsync, clearIntervalAsync } from 'set-interval-async';
-
-let simpleGitOptions: Partial<SimpleGitOptions>;
-let git: SimpleGit;
+import { App, Notice, Platform, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { setIntervalAsync } from 'set-interval-async';
 
 type NoticeLevelSetting = 'ALL' | 'WARNING' | 'ERROR';
 type LegacyNoticeLevelSetting = NoticeLevelSetting | 'WARNINGS';
@@ -12,7 +8,7 @@ type NoticeSeverity = 'INFO' | 'WARNING' | 'ERROR';
 
 interface GHSyncSettings {
 	remoteURL: string;
-	gitLocation: string;
+	githubToken: string;
 	syncinterval: number;
 	isSyncOnLoad: boolean;
 	checkStatusOnLoad: boolean;
@@ -22,7 +18,7 @@ interface GHSyncSettings {
 
 const DEFAULT_SETTINGS: GHSyncSettings = {
 	remoteURL: '',
-	gitLocation: '',
+	githubToken: '',
 	syncinterval: 0,
 	isSyncOnLoad: false,
 	checkStatusOnLoad: true,
@@ -30,6 +26,33 @@ const DEFAULT_SETTINGS: GHSyncSettings = {
 	showSyncSuccessNotice: true,
 }
 
+function parseGitHubUrl(url: string): { owner: string; repo: string } | null {
+	const https = url.match(/github\.com\/([^\/]+)\/([^\/\.]+)/);
+	if (https) return { owner: https[1], repo: https[2] };
+	const ssh = url.match(/github\.com:([^\/]+)\/([^\/\.]+)/);
+	if (ssh) return { owner: ssh[1], repo: ssh[2] };
+	return null;
+}
+
+async function githubRequest(token: string, method: string, url: string, body?: object): Promise<any> {
+	const resp = await fetch(url, {
+		method,
+		headers: {
+			'Authorization': 'Bearer ' + token,
+			'Accept': 'application/vnd.github+json',
+			'Content-Type': 'application/json',
+			'X-GitHub-Api-Version': '2022-11-28'
+		},
+		body: body ? JSON.stringify(body) : undefined
+	});
+	if (!resp.ok) {
+		const err = await resp.text();
+		throw new Error(`GitHub API error ${resp.status}: ${err}`);
+	}
+	// 204 No Content
+	if (resp.status === 204) return null;
+	return resp.json();
+}
 
 export default class GHSyncPlugin extends Plugin {
 
@@ -67,139 +90,129 @@ export default class GHSyncPlugin extends Plugin {
 	async SyncNotes()
 	{
 		const remote = this.settings.remoteURL.trim();
+		const token = this.settings.githubToken.trim();
 
-		simpleGitOptions = {
-			//@ts-ignore
-		    baseDir: this.app.vault.adapter.getBasePath(),
-		    binary: this.settings.gitLocation + "git",
-		    maxConcurrentProcesses: 6,
-		    trimmed: false,
-		};
-		git = simpleGit(simpleGitOptions);
-
-		let os = require("os");
-		let hostname = os.hostname();
-
-		let statusResult = await git.status().catch((e) => {
-			this.showNotice("Vault is not a Git repo or git binary cannot be found.", 'ERROR', 10000);
-			return; })
-
-		if (!statusResult) {
+		if (!remote || !token) {
+			this.showNotice("GitHub Sync: Remote URL and GitHub Token are required.", 'ERROR', 10000);
 			return;
 		}
 
-		//@ts-ignore
-		let clean = statusResult.isClean();
+		const parsed = parseGitHubUrl(remote);
+		if (!parsed) {
+			this.showNotice("GitHub Sync: Could not parse owner/repo from Remote URL.", 'ERROR', 10000);
+			return;
+		}
+		const { owner, repo } = parsed;
 
-    	let date = new Date();
-    	let msg = hostname + " " + date.getFullYear() + "-" + (date.getMonth() + 1) + "-" + date.getDate() + ":" + date.getHours() + ":" + date.getMinutes() + ":" + date.getSeconds();
+		const hostname = Platform.isMobileApp ? "mobile" : "desktop";
+		const date = new Date();
+		const msg = `${hostname} ${date.getFullYear()}-${date.getMonth()+1}-${date.getDate()}:${date.getHours()}:${date.getMinutes()}:${date.getSeconds()}`;
 
-		// git add .
-		// git commit -m hostname-date-time
-		if (!clean) {
+		const files = this.app.vault.getFiles();
+		const conflicts: string[] = [];
+
+		for (const file of files) {
+			const localContent = await this.app.vault.read(file);
+			const localBase64 = btoa(unescape(encodeURIComponent(localContent)));
+
+			let remoteFile: any = null;
 			try {
-				await git
-		    		.add("./*")
-		    		.commit(msg);
-		    } catch (e) {
-		    	this.showNotice(e, 'ERROR', 10000);
-		    	return;
-		    }
-		}
-
-		// configure remote
-		try {
-			await git.removeRemote('origin').catch((e) => { this.showNotice(e, 'ERROR', 10000); });
-			await git.addRemote('origin', remote).catch((e) => { this.showNotice(e, 'ERROR', 10000); });
-		}
-		catch (e) {
-			this.showNotice(e, 'ERROR', 10000);
-			return;
-		}
-		// check if remote url valid by fetching
-		try {
-			await git.fetch();
-		} catch (e) {
-			this.showNotice(String(e) + "\nGitHub Sync: Invalid remote URL.", 'ERROR', 10000);
-			return;
-		}
-
-		// git pull origin main
-	    try {
-	    	//@ts-ignore
-	    	await git.pull('origin', 'main', { '--no-rebase': null }, (err, update) => {
-	   		})
-	    } catch (e) {
-	    	let conflictStatus = await git.status().catch((error) => { this.showNotice(error, 'ERROR', 10000); return; });
-	    	if (!conflictStatus) {
-	    		return;
-	    	}
-    		let conflictMsg = "Merge conflicts in:";
-	    	//@ts-ignore
-			for (let c of conflictStatus.conflicted)
-			{
-				conflictMsg += "\n\t"+c;
+				remoteFile = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}/contents/${file.path}`);
+			} catch (e: any) {
+				// 404 = file doesn't exist on remote yet, we'll create it
+				if (!String(e.message).includes('404')) {
+					this.showNotice(e, 'ERROR', 10000);
+					return;
+				}
 			}
-			conflictMsg += "\nResolve them or click sync button again to push with unresolved conflicts."
+
+			if (remoteFile) {
+				const remoteBase64 = remoteFile.content.replace(/\n/g, '');
+				const remoteContent = decodeURIComponent(escape(atob(remoteBase64)));
+
+				if (remoteContent === localContent) {
+					// No changes, skip
+					continue;
+				}
+
+				// Both sides differ — treat as conflict
+				conflicts.push(file.path);
+				continue;
+			}
+
+			// File doesn't exist on remote — create it
+			try {
+				await githubRequest(token, 'PUT', `https://api.github.com/repos/${owner}/${repo}/contents/${file.path}`, {
+					message: msg,
+					content: localBase64,
+				});
+			} catch (e) {
+				this.showNotice(e, 'ERROR', 10000);
+				return;
+			}
+		}
+
+		if (conflicts.length > 0) {
+			const conflictMsg = `Merge conflicts in:\n\t${conflicts.join('\n\t')}\nResolve them or click sync button again to push with unresolved conflicts.`;
 			this.showNotice(conflictMsg, 'WARNING');
-			//@ts-ignore	
-			for (let c of conflictStatus.conflicted)
-			{
+			for (const c of conflicts) {
 				this.app.workspace.openLinkText("", c, true);
 			}
-	    	return;
-	    }
-
-		// resolve merge conflicts
-		// git push origin main
-	    if (!clean) {
-		    try {
-		    	await git.push('origin', 'main', ['-u']);
-		    } catch (e) {
-		    	this.showNotice(e, 'ERROR', 10000);
-		    	return;
-			}
-	    }
+			return;
+		}
 
 		this.showSyncSuccessNotice();
 	}
 
 	async CheckStatusOnStart()
 	{
-		// check status
 		try {
-			simpleGitOptions = {
-				//@ts-ignore
-			    baseDir: this.app.vault.adapter.getBasePath(),
-			    binary: this.settings.gitLocation + "git",
-			    maxConcurrentProcesses: 6,
-			    trimmed: false,
-			};
-			git = simpleGit(simpleGitOptions);
+			const remote = this.settings.remoteURL.trim();
+			const token = this.settings.githubToken.trim();
 
-			//check for remote changes
-			// git branch --set-upstream-to=origin/main main
-			await git.branch({'--set-upstream-to': 'origin/main'});
-			let statusUponOpening = await git.fetch().status();
-			if (statusUponOpening.behind > 0)
-			{
-				// Automatically sync if needed
-				if (this.settings.isSyncOnLoad == true)
-				{
-					this.SyncNotes();
+			if (!remote || !token) {
+				return;
+			}
+
+			const parsed = parseGitHubUrl(remote);
+			if (!parsed) {
+				return;
+			}
+			const { owner, repo } = parsed;
+
+			const files = this.app.vault.getFiles();
+			let behind = false;
+
+			for (const file of files) {
+				let remoteFile: any = null;
+				try {
+					remoteFile = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}/contents/${file.path}`);
+				} catch (e) {
+					// file not on remote, skip
+					continue;
 				}
-				else
-				{
-					this.showNotice("GitHub Sync: " + statusUponOpening.behind + " commits behind remote.\nClick the GitHub ribbon icon to sync.", 'WARNING');
+
+				if (remoteFile) {
+					const localContent = await this.app.vault.read(file);
+					const remoteContent = decodeURIComponent(escape(atob(remoteFile.content.replace(/\n/g, ''))));
+					if (remoteContent !== localContent) {
+						behind = true;
+						break;
+					}
 				}
 			}
-			else
-			{
+
+			if (behind) {
+				if (this.settings.isSyncOnLoad) {
+					this.SyncNotes();
+				} else {
+					this.showNotice("GitHub Sync: vault is behind remote.\nClick the GitHub ribbon icon to sync.", 'WARNING');
+				}
+			} else {
 				this.showNotice("GitHub Sync: up to date with remote.", 'INFO');
 			}
 		} catch (e) {
 			// don't care
-			// based
 		}
 	}
 
@@ -277,7 +290,7 @@ class GHSyncSettingTab extends PluginSettingTab {
 
 		const howto = containerEl.createEl("div", { cls: "howto" });
 		howto.createEl("div", { text: "How to use this plugin", cls: "howto_title" });
-		howto.createEl("small", { text: "Grab your GitHub repository's HTTPS or SSH url and paste it into the settings here. If you're not authenticated, the first sync with this plugin should prompt you to authenticate. If you've already setup SSH on your device with GitHub, you won't need to authenticate - just paste your repo's SSH url into the settings here.", cls: "howto_text" });
+		howto.createEl("small", { text: "Grab your GitHub repository's HTTPS or SSH url and paste it into the settings here. Create a GitHub Personal Access Token with 'repo' scope and paste it in the token field below.", cls: "howto_text" });
 		howto.createEl("br");
         const linkEl = howto.createEl('p');
         linkEl.createEl('span', { text: 'See the ' });
@@ -297,16 +310,18 @@ class GHSyncSettingTab extends PluginSettingTab {
         	.inputEl.addClass('my-plugin-setting-text'));
 
 		new Setting(containerEl)
-			.setName('git binary location')
-			.setDesc('This is optional! Set this only if git is not findable via your system PATH, then provide its location here. See README for more info.')
-			.addText(text => text
-				.setPlaceholder('')
-				.setValue(this.plugin.settings.gitLocation)
-				.onChange(async (value) => {
-					this.plugin.settings.gitLocation = value;
-					await this.plugin.saveSettings();
-				})
-        	.inputEl.addClass('my-plugin-setting-text2'));
+			.setName('GitHub Personal Access Token')
+			.setDesc('Required for authentication. Create a token at github.com → Settings → Developer settings → Personal access tokens. Token needs "repo" scope.')
+			.addText(text => {
+				text
+					.setPlaceholder('ghp_...')
+					.setValue(this.plugin.settings.githubToken)
+					.onChange(async (value) => {
+						this.plugin.settings.githubToken = value;
+						await this.plugin.saveSettings();
+					});
+				text.inputEl.type = 'password';
+			});
 
 		new Setting(containerEl)
 			.setName('Notice level')
@@ -362,3 +377,4 @@ class GHSyncSettingTab extends PluginSettingTab {
 				}));
 	}
 }
+
