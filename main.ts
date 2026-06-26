@@ -62,7 +62,7 @@ async function githubRequest(token: string, method: string, url: string, body?: 
 		},
 		body: body ? JSON.stringify(body) : undefined
 	});
-	if (resp.status === 404) return null;
+	if (resp.status === 404 && method === 'GET') return null;
 	if (!resp.ok) {
 		const err = await resp.text();
 		throw new Error(`GitHub API error ${resp.status}: ${err}`);
@@ -99,7 +99,9 @@ async function listRemoteFilePaths(token: string, owner: string, repo: string): 
 	if (!repoData) return [];
 	const ref = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${repoData.default_branch}`);
 	if (!ref || !ref.object) return [];
-	const tree = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}/git/trees/${ref.object.sha}?recursive=1`);
+	const commit = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}/git/commits/${ref.object.sha}`);
+	if (!commit || !commit.tree) return [];
+	const tree = await githubRequest(token, 'GET', `https://api.github.com/repos/${owner}/${repo}/git/trees/${commit.tree.sha}?recursive=1`);
 	if (!tree || !tree.tree) return [];
 	return tree.tree.filter((item: any) => item.type === 'blob').map((item: any) => item.path as string);
 }
@@ -188,15 +190,13 @@ export default class GHSyncPlugin extends Plugin {
 					continue;
 				}
 
-				// Remote and local differ — remote wins, update local from remote
+				// Local and remote differ — local wins, push local content to remote
 				try {
-					const binary = atob(remoteBase64);
-					const bytes = new Uint8Array(binary.length);
-					for (let i = 0; i < binary.length; i++) {
-						bytes[i] = binary.charCodeAt(i);
-					}
-					await this.app.vault.modifyBinary(file, bytes.buffer);
-					updatedFromRemote.push(file.path);
+					await githubRequest(token, 'PUT', buildContentsApiUrl(owner, repo, file.path), {
+						message: msg,
+						content: localBase64,
+						sha: remoteFile.sha,
+					});
 				} catch (e) {
 					this.showNotice(e, 'ERROR', 10000);
 					return;
@@ -310,7 +310,7 @@ export default class GHSyncPlugin extends Plugin {
 
 			if (behind) {
 				if (this.settings.isSyncOnLoad) {
-					this.SyncNotes();
+					await this.SyncNotes();
 				} else {
 					this.showNotice("GitHub Sync: vault content differs from remote.\nClick the GitHub ribbon icon to sync.", 'WARNING');
 				}
@@ -417,7 +417,7 @@ class GHSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('GitHub Personal Access Token')
-			.setDesc('Required for authentication. Create a token at github.com → Settings → Developer settings → Personal access tokens. Token needs "repo" scope.')
+			.setDesc('Required for authentication. Create a token at github.com → Settings → Developer settings → Personal access tokens. Token needs "repo" scope. Note: this token is stored in plain text on disk and is not encrypted by Obsidian.')
 			.addText(text => {
 				text
 					.setPlaceholder('ghp_...')
